@@ -1,0 +1,126 @@
+{
+    "name": "message-to-image",
+    "displayName": "消息转图片",
+    "version": "1.0.0",
+    "author": "gateway-plugin",
+    "description": "将AI回复内容渲染为精美图片发送。支持ST正则美化规则导入、自定义HTML模板和CSS、内置4套预设模板。Puppeteer渲染引擎，带缓存和并发控制。",
+    "main": "index.js",
+    "priority": 100,
+    "enabled": false,
+    "dependencies": [],
+    "permissions": ["config"],
+    "configUi": "auto",
+    "config": {
+        "enabled": {
+            "type": "boolean",
+            "default": false,
+            "description": "是否启用消息转图片（需先安装 puppeteer 依赖）",
+            "ui": { "group": "基本", "order": 1 }
+        },
+        "renderMode": {
+            "type": "string",
+            "default": "auto",
+            "description": "渲染模式：auto=超过最小长度时渲染，always=全部渲染，tagged=仅渲染标签内容",
+            "enum": [
+                { "value": "auto", "label": "自动（长度阈值）" },
+                { "value": "always", "label": "全部渲染" },
+                { "value": "tagged", "label": "仅标签内容" }
+            ],
+            "ui": { "group": "基本", "order": 2 }
+        },
+        "renderTag": {
+            "type": "string",
+            "default": "maintext",
+            "description": "tagged 模式下匹配的标签名（如 maintext）",
+            "ui": { "group": "基本", "order": 3, "placeholder": "maintext" }
+        },
+        "minLength": {
+            "type": "number",
+            "default": 100,
+            "description": "auto 模式下触发渲染的最小文本长度",
+            "ui": { "group": "基本", "order": 4, "min": 0, "step": 50, "unit": "字符" }
+        },
+        "templatePreset": {
+            "type": "string",
+            "default": "novel-card",
+            "description": "内置模板预设（选择后覆盖自定义模板）",
+            "enum": [
+                { "value": "novel-card", "label": "小说卡片" },
+                { "value": "gal-dialogue", "label": "Galgame对话框" },
+                { "value": "dark-terminal", "label": "终端暗色" },
+                { "value": "minimal", "label": "极简白底" }
+            ],
+            "ui": { "group": "模板", "order": 5 }
+        },
+        "baseHtml": {
+            "type": "string",
+            "default": "",
+            "description": "自定义 HTML 模板（留空=用预设模板）。需包含 {{content}} 占位符和 .render-root 类",
+            "ui": { "group": "模板", "order": 6, "inputMode": "textarea", "placeholder": "<div class='render-root'>{{content}}</div>" }
+        },
+        "baseCss": {
+            "type": "string",
+            "default": "",
+            "description": "自定义 CSS 样式（留空=用预设样式）",
+            "ui": { "group": "模板", "order": 7, "inputMode": "textarea", "placeholder": ".render-root { background: #fff; color: #333; padding: 24px; }" }
+        },
+        "fontFamily": {
+            "type": "string",
+            "default": "Microsoft YaHei, sans-serif",
+            "description": "字体族",
+            "ui": { "group": "模板", "order": 8, "placeholder": "Microsoft YaHei, sans-serif" }
+        },
+        "imageFormat": {
+            "type": "string",
+            "default": "png",
+            "description": "图片格式",
+            "enum": [
+                { "value": "png", "label": "PNG（无损）" },
+                { "value": "jpeg", "label": "JPEG（更小）" }
+            ],
+            "ui": { "group": "渲染", "order": 9 }
+        },
+        "imageQuality": {
+            "type": "number",
+            "default": 90,
+            "description": "JPEG 图片质量（仅 jpeg 格式生效）",
+            "ui": { "group": "渲染", "order": 10, "min": 1, "max": 100, "step": 5, "unit": "%" }
+        },
+        "maxWidth": {
+            "type": "number",
+            "default": 800,
+            "description": "图片最大宽度（像素）",
+            "ui": { "group": "渲染", "order": 11, "min": 200, "step": 50, "unit": "px" }
+        },
+        "maxConcurrent": {
+            "type": "number",
+            "default": 2,
+            "description": "最大并发渲染数（防止内存爆炸）",
+            "ui": { "group": "渲染", "order": 12, "min": 1, "max": 10, "step": 1 }
+        },
+        "cacheDays": {
+            "type": "number",
+            "default": 7,
+            "description": "缓存文件保留天数（超过后自动清理）",
+            "ui": { "group": "渲染", "order": 13, "min": 1, "step": 1, "unit": "天" }
+        },
+        "executablePath": {
+            "type": "string",
+            "default": "",
+            "description": "Chrome 可执行文件路径（留空=用 puppeteer 自带 Chromium）",
+            "ui": { "group": "渲染", "order": 14, "placeholder": "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" }
+        },
+        "applyToPlatforms": {
+            "type": "array",
+            "default": [],
+            "description": "仅对这些平台生效（空数组=全部平台）",
+            "ui": { "group": "过滤", "order": 15, "inputMode": "csv", "placeholder": "qq,telegram,discord" }
+        },
+        "stRules": {
+            "type": "array",
+            "default": [],
+            "description": "ST 正则规则（通过 /msg2img import-st 导入，或在此手动填写 JSON 数组）",
+            "ui": { "group": "正则规则", "order": 16, "inputMode": "textarea" }
+        }
+    }
+}

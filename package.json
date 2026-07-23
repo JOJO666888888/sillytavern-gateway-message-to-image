@@ -1,0 +1,9 @@
+{
+    "name": "message-to-image",
+    "version": "1.0.0",
+    "type": "module",
+    "description": "SillyTavern Gateway 插件：将AI回复渲染为图片",
+    "dependencies": {
+        "puppeteer": "^21.0.0"
+    }
+}
