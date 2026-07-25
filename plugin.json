@@ -1,9 +1,9 @@
 {
     "name": "message-to-image",
     "displayName": "消息转图片",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "author": "gateway-plugin",
-    "description": "将AI回复内容渲染为精美图片发送。支持ST正则美化规则导入、自定义HTML模板和CSS、内置4套预设模板。Puppeteer渲染引擎，带缓存和并发控制。",
+    "description": "将AI回复内容渲染为精美图片发送。支持ST正则美化规则导入、自定义HTML模板和CSS、内置4套预设模板。基于puppeteer-core渲染引擎，带缓存、并发控制和分级日志。需系统已安装Chrome/Chromium。",
     "main": "index.js",
     "priority": 100,
     "enabled": false,
@@ -14,7 +14,7 @@
         "enabled": {
             "type": "boolean",
             "default": false,
-            "description": "是否启用消息转图片（需先安装 puppeteer 依赖）",
+            "description": "是否启用消息转图片（需先安装 puppeteer-core 依赖并确保系统有 Chrome/Chromium）",
             "ui": { "group": "基本", "order": 1 }
         },
         "renderMode": {
@@ -107,8 +107,8 @@
         "executablePath": {
             "type": "string",
             "default": "",
-            "description": "Chrome 可执行文件路径（留空=用 puppeteer 自带 Chromium）",
-            "ui": { "group": "渲染", "order": 14, "placeholder": "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" }
+            "description": "Chrome 可执行文件路径（留空=自动检测系统已安装的 Chrome/Chromium。如自动检测失败请手动指定）",
+            "ui": { "group": "渲染", "order": 14, "placeholder": "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe 或 /usr/bin/chromium-browser" }
         },
         "applyToPlatforms": {
             "type": "array",

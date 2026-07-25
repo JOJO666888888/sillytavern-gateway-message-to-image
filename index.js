@@ -155,7 +155,7 @@ export default class MessageToImagePlugin extends GatewayPlugin {
             this._log('info', '渲染引擎已就绪');
         } catch (err) {
             this._log('error', `渲染引擎初始化失败: ${err.message}`);
-            this._log('error', '请确保已安装 puppeteer 依赖 (在插件目录执行 npm install)');
+            this._log('error', '请确保已安装 puppeteer-core 依赖 (在插件目录执行 npm install) 并配置 Chrome 浏览器');
             this._renderer = null;
         }
     }

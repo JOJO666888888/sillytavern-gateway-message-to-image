@@ -1,4 +1,4 @@
-import puppeteer from 'puppeteer';
+import puppeteer from 'puppeteer-core';
 import { createHash } from 'crypto';
 import path from 'path';
 import fs from 'fs/promises';
@@ -7,6 +7,26 @@ import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+/**
+ * 系统已安装的 Chrome/Chromium 可能路径（按优先级排序）
+ * 覆盖 Linux 桌面、macOS、Windows、Termux(Android) 等环境
+ */
+const SYSTEM_CHROME_PATHS = [
+    // Linux 桌面
+    '/usr/bin/chromium-browser',
+    '/usr/bin/chromium',
+    '/usr/bin/google-chrome',
+    '/usr/bin/google-chrome-stable',
+    // macOS
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    // Termux (Android)
+    '/data/data/com.termux/files/usr/bin/chromium-browser',
+    '/data/data/com.termux/files/usr/bin/chromium',
+    // Windows 常见路径（用反斜杠，existsSync 兼容）
+    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+];
 
 /**
  * 轻量日志记录器
@@ -125,9 +145,22 @@ export class ImageRenderer {
 
         if (this.options.executablePath) {
             launchOptions.executablePath = this.options.executablePath;
-            this.logger.info('使用指定 Chrome 路径', { path: this.options.executablePath });
+            this.logger.info('使用配置指定的 Chrome 路径', { path: this.options.executablePath });
         } else {
-            this.logger.info('使用 puppeteer 自带 Chromium');
+            // 自动检测系统已安装的 Chrome/Chromium
+            let detected = null;
+            for (const p of SYSTEM_CHROME_PATHS) {
+                if (existsSync(p)) {
+                    detected = p;
+                    break;
+                }
+            }
+            if (detected) {
+                launchOptions.executablePath = detected;
+                this.logger.info('自动检测到系统 Chrome', { path: detected });
+            } else {
+                this.logger.warn('未找到系统 Chrome，puppeteer-core 需要外部浏览器。请在配置中设置 executablePath');
+            }
         }
 
         try {
@@ -136,7 +169,7 @@ export class ImageRenderer {
             this.logger.info('Puppeteer Browser 已启动');
         } catch (err) {
             this.logger.error('Puppeteer 启动失败', { error: err.message });
-            throw new Error(`Puppeteer 启动失败: ${err.message}。请确保已安装 puppeteer 依赖 (npm install) 或配置 executablePath 指向已安装的 Chrome。`);
+            throw new Error(`Puppeteer 启动失败: ${err.message}。请确保已安装 puppeteer-core 依赖 (npm install) 并配置 Chrome 浏览器（通过 executablePath 或系统自动检测）。`);
         }
 
         // 初始化页面池
