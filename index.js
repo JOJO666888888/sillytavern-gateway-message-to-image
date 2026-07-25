@@ -1,11 +1,12 @@
 /**
- * 消息转图片插件 (message-to-image)
+ * 消息转图片插件 (message-to-image) v1.1
  *
  * 将 AI 回复内容渲染为精美图片发送。
  * - 复用 SillyTavern 正则美化规则
  * - 支持自定义 HTML 模板和 CSS
  * - 内置 4 套预设模板
- * - Puppeteer 渲染，Browser 复用 + Page 池 + LRU 文件缓存
+ * - Puppeteer 渲染引擎，Browser 复用 + Page 池 + LRU 文件缓存
+ * - 分级日志系统（INFO/WARN/ERROR/DEBUG）+ 日志查看/导出
  *
  * 依赖网关 R1 (bypassFilters) / R3 (schema 驱动 UI)
  */
@@ -13,6 +14,7 @@
 import { GatewayPlugin } from '../../server/plugin-sdk.js';
 import { OutboundMessage } from '../../server/adapters/base-adapter.js';
 import path from 'path';
+import fs from 'fs/promises';
 import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -25,7 +27,7 @@ export default class MessageToImagePlugin extends GatewayPlugin {
             alias: ['转图'],
             handler: 'handleCommand',
             description: '消息转图片插件配置',
-            usage: '/msg2img <on|off|status|test|clear-cache>',
+            usage: '/msg2img <on|off|status|test|clear-cache|log|export-log|help>',
         },
     ];
 
@@ -36,21 +38,30 @@ export default class MessageToImagePlugin extends GatewayPlugin {
         this._removeFilter = null;
         this._renderer = null;
         this._cleanupTimer = null;
+        this._pluginLogger = null; // 自定义日志记录器
     }
 
     async onLoad() {
         this._ensureDefaults();
 
+        // 初始化自定义日志记录器
+        try {
+            const { PluginLogger } = await import('./renderer.js');
+            this._pluginLogger = new PluginLogger(500);
+            this._pluginLogger.info('插件加载开始');
+        } catch (err) {
+            this.logger.error(`日志记录器初始化失败: ${err.message}`);
+        }
+
         const gateway = this._services.gateway;
         if (gateway && typeof gateway.addOutboundFilter === 'function') {
-            // priority=20: 在 regex-filter(10) 之后执行
             this._removeFilter = gateway.addOutboundFilter(
                 (msg) => this.filterOutbound(msg),
                 { name: 'message-to-image', priority: 20 }
             );
-            this.logger.info('消息转图片过滤器已挂载 (priority=20)');
+            this._log('info', '出站过滤器已挂载', { priority: 20 });
         } else {
-            this.logger.warn('网关不支持出站过滤器');
+            this._log('warn', '网关不支持出站过滤器');
         }
 
         // 初始化渲染引擎
@@ -58,9 +69,12 @@ export default class MessageToImagePlugin extends GatewayPlugin {
 
         // 启动定时缓存清理（每 24 小时）
         this._startCleanupTimer();
+
+        this._log('info', '插件加载完成');
     }
 
     async onUnload() {
+        this._log('info', '插件开始卸载');
         if (this._removeFilter) {
             this._removeFilter();
             this._removeFilter = null;
@@ -73,16 +87,34 @@ export default class MessageToImagePlugin extends GatewayPlugin {
             await this._renderer.dispose();
             this._renderer = null;
         }
+        this._log('info', '插件已卸载');
+    }
+
+    // ==================== 日志辅助 ====================
+
+    _log(level, message, context = null) {
+        if (this._pluginLogger) {
+            this._pluginLogger[level](message, context);
+        }
+        // 同时输出到网关 logger
+        if (this.logger) {
+            const ctxStr = context ? ` ${typeof context === 'string' ? context : JSON.stringify(context)}` : '';
+            const fullMsg = `${message}${ctxStr}`;
+            if (level === 'error') this.logger.error(fullMsg);
+            else if (level === 'warn') this.logger.warn(fullMsg);
+            else if (level === 'debug') this.logger.debug(fullMsg);
+            else this.logger.info(fullMsg);
+        }
     }
 
     // ==================== 默认配置 ====================
 
     _ensureDefaults() {
         const defaults = {
-            enabled: false,           // 默认关闭，用户确认 Chrome 可用后手动开启
-            renderMode: 'auto',       // auto | always | tagged
-            renderTag: 'maintext',    // tagged 模式下匹配的标签名
-            minLength: 100,           // auto 模式下的最小渲染长度
+            enabled: false,
+            renderMode: 'auto',
+            renderTag: 'maintext',
+            minLength: 100,
             imageFormat: 'png',
             imageQuality: 90,
             maxWidth: 800,
@@ -92,9 +124,9 @@ export default class MessageToImagePlugin extends GatewayPlugin {
             templatePreset: 'novel-card',
             baseHtml: '',
             baseCss: '',
-            executablePath: '',       // Chrome 可执行文件路径（留空=用 puppeteer 自带）
+            executablePath: '',
             applyToPlatforms: [],
-            stRules: [],              // ST 正则规则数组
+            stRules: [],
         };
         for (const [key, val] of Object.entries(defaults)) {
             if (this.getConfig(key) === undefined) this.setConfig(key, val);
@@ -105,7 +137,6 @@ export default class MessageToImagePlugin extends GatewayPlugin {
 
     async _initRenderer() {
         try {
-            // 动态导入，避免 puppeteer 未安装时整个插件崩溃
             const { ImageRenderer } = await import('./renderer.js');
 
             const cacheDir = path.join(__dirname, 'cache');
@@ -117,13 +148,14 @@ export default class MessageToImagePlugin extends GatewayPlugin {
                 maxConcurrent: Number(this.getConfig('maxConcurrent')) || 2,
                 fontFamily: this.getConfig('fontFamily') || 'Microsoft YaHei, sans-serif',
                 executablePath: this.getConfig('executablePath') || '',
+                logger: this._pluginLogger,
             });
 
             await this._renderer.init();
-            this.logger.info('Puppeteer 渲染引擎已就绪');
+            this._log('info', '渲染引擎已就绪');
         } catch (err) {
-            this.logger.error(`渲染引擎初始化失败: ${err.message}`);
-            this.logger.error('请确保已安装 puppeteer 依赖 (在插件目录执行 npm install)');
+            this._log('error', `渲染引擎初始化失败: ${err.message}`);
+            this._log('error', '请确保已安装 puppeteer 依赖 (在插件目录执行 npm install)');
             this._renderer = null;
         }
     }
@@ -132,38 +164,58 @@ export default class MessageToImagePlugin extends GatewayPlugin {
 
     /**
      * 出站消息过滤器
-     * @param {OutboundMessage} message
-     * @returns {OutboundMessage|null}
      */
     filterOutbound(message) {
+        // 基础校验
         if (!message || !message.content) return message;
+
+        // 开关检查
         if (this.getConfig('enabled') !== true) return message;
-        if (!this._renderer || !this._renderer.ready) return message;
+
+        // 渲染引擎就绪检查
+        if (!this._renderer || !this._renderer.ready) {
+            this._log('warn', '渲染引擎未就绪，消息原样放行');
+            return message;
+        }
 
         // 平台过滤
         const platforms = this.getConfig('applyToPlatforms') || [];
-        if (platforms.length > 0 && !platforms.includes(message.platform)) return message;
+        if (platforms.length > 0 && !platforms.includes(message.platform)) {
+            return message;
+        }
 
-        // 递归守卫：已被本插件处理过的消息跳过
+        // 递归守卫
         if (message.metadata?._msg2imgProcessed) return message;
 
         // 判断是否需要渲染
         const renderMode = this.getConfig('renderMode') || 'auto';
         const { shouldRender, renderContent, isExcerpt } = this._extractRenderContent(message.content, renderMode);
 
-        if (!shouldRender) return message;
+        if (!shouldRender) {
+            this._log('debug', '消息不满足渲染条件，原样放行', {
+                mode: renderMode,
+                contentLength: message.content.length,
+                minLength: this.getConfig('minLength'),
+            });
+            return message;
+        }
+
+        this._log('info', '消息命中渲染条件，启动异步渲染', {
+            mode: renderMode,
+            contentLength: message.content.length,
+            renderContentLength: renderContent.length,
+            isExcerpt,
+        });
 
         // 异步渲染（不阻塞过滤器链）
         this._renderAndReplace(message, renderContent, isExcerpt);
 
-        // 返回原消息（渲染完成前先放行；渲染完成后用 sendDirect 补发图片）
-        // 但这样会导致原文本也被发送——所以改为：先丢弃原消息，渲染完成后补发
+        // 丢弃原消息（渲染完成后补发图片）
         return null;
     }
 
     /**
      * 根据渲染模式提取要渲染的内容
-     * @returns {{ shouldRender: boolean, renderContent: string, isExcerpt: boolean }}
      */
     _extractRenderContent(content, mode) {
         const minLength = Number(this.getConfig('minLength')) || 100;
@@ -179,6 +231,7 @@ export default class MessageToImagePlugin extends GatewayPlugin {
             if (match) {
                 return { shouldRender: true, renderContent: match[1].trim(), isExcerpt: true };
             }
+            this._log('debug', 'tagged 模式未找到标签', { tag });
             return { shouldRender: false, renderContent: '', isExcerpt: false };
         }
 
@@ -194,7 +247,12 @@ export default class MessageToImagePlugin extends GatewayPlugin {
      */
     async _renderAndReplace(originalMessage, renderContent, isExcerpt) {
         const gateway = this._services.gateway;
-        if (!gateway) return;
+        if (!gateway) {
+            this._log('error', '网关实例不可用，无法补发');
+            return;
+        }
+
+        const startTime = Date.now();
 
         try {
             // 准备模板
@@ -214,6 +272,12 @@ export default class MessageToImagePlugin extends GatewayPlugin {
             // 应用 ST 正则规则
             const stRules = this.getConfig('stRules') || [];
 
+            this._log('info', '开始渲染', {
+                template: template.preset,
+                variables,
+                stRulesCount: stRules.length,
+            });
+
             // 渲染
             const imageUrl = await this._renderer.render(
                 this._escapeHtml(renderContent),
@@ -222,6 +286,8 @@ export default class MessageToImagePlugin extends GatewayPlugin {
                 stRules,
                 variables
             );
+
+            this._log('info', `渲染成功 (${Date.now() - startTime}ms)`, { imageUrl });
 
             // 构造图片消息
             const imgMsg = new OutboundMessage({
@@ -234,26 +300,28 @@ export default class MessageToImagePlugin extends GatewayPlugin {
             });
             imgMsg.metadata = { ...originalMessage.metadata, _msg2imgProcessed: true };
 
-            // 如果是截取模式（tagged），原消息还需要发送（去掉标签内容的部分）
+            // 如果是截取模式（tagged），先发送剩余文本
             if (isExcerpt) {
-                // 先发送剩余文本（去掉标签块的内容）
                 const tag = this.getConfig('renderTag') || 'maintext';
                 const tagRegex = new RegExp(`<${tag}>[\\s\\S]*?</${tag}>`, 'i');
                 const remainingText = originalMessage.content.replace(tagRegex, '').trim();
 
                 if (remainingText) {
+                    this._log('info', 'tagged 模式：先发送剩余文本', { remainingLength: remainingText.length });
                     originalMessage.content = remainingText;
                     originalMessage.metadata._msg2imgProcessed = true;
-                    // 放行原消息（去掉标签后的剩余文本）
                     gateway.sendDirect(originalMessage, { bypassFilters: true, skipDedup: true });
                 }
             }
 
             // 发送图片
+            this._log('info', '发送图片消息', { platform: imgMsg.platform, chatId: imgMsg.chatId });
             await gateway.sendDirect(imgMsg, { bypassFilters: true, skipDedup: true });
-            this.logger.info(`消息已渲染为图片: ${imageUrl}`);
+            this._log('info', '图片消息已发送');
         } catch (err) {
-            this.logger.error(`渲染失败，回退为原文本: ${err.message}`);
+            this._log('error', `渲染失败，回退为原文本: ${err.message}`, {
+                stack: err.stack?.split('\n').slice(0, 3).join(' | '),
+            });
             // 渲染失败：补发原始消息
             const fallbackMsg = new OutboundMessage({
                 platform: originalMessage.platform,
@@ -263,7 +331,12 @@ export default class MessageToImagePlugin extends GatewayPlugin {
                 replyToId: originalMessage.replyToId || '',
             });
             fallbackMsg.metadata = { ...originalMessage.metadata, _msg2imgProcessed: true };
-            await gateway.sendDirect(fallbackMsg, { bypassFilters: true, skipDedup: true });
+            try {
+                await gateway.sendDirect(fallbackMsg, { bypassFilters: true, skipDedup: true });
+                this._log('info', '原文本已补发');
+            } catch (sendErr) {
+                this._log('error', `补发原文本也失败: ${sendErr.message}`);
+            }
         }
     }
 
@@ -283,26 +356,22 @@ export default class MessageToImagePlugin extends GatewayPlugin {
 
     _startCleanupTimer() {
         const cacheDays = Number(this.getConfig('cacheDays')) || 7;
-        // 每 24 小时清理一次
         this._cleanupTimer = setInterval(() => {
             if (this._renderer) {
                 this._renderer.cleanupCache(cacheDays).catch(() => {});
             }
         }, 24 * 60 * 60 * 1000);
+        this._log('info', '定时缓存清理已启动', { cacheDays });
     }
 
     // ==================== ST 正则规则导入 ====================
 
     /**
      * 从 SillyTavern 正则规则导入
-     * 兼容 ST 原生字段格式（find_regex / findRegex / pattern 等）
-     * @param {string|object|array} input - ST 正则规则 JSON
-     * @returns {{ imported: number, skipped: number }}
      */
     importFromST(input) {
         let rules = input;
 
-        // 解析输入
         if (typeof input === 'string') {
             try {
                 rules = JSON.parse(input);
@@ -323,13 +392,11 @@ export default class MessageToImagePlugin extends GatewayPlugin {
         for (const raw of rules) {
             const normalized = this._normalizeSTRule(raw);
 
-            // 过滤：只导入 display 规则
             if (normalized.destination && normalized.destination.display !== true) {
                 skipped++;
                 continue;
             }
 
-            // 去重
             const pattern = normalized.findRegex || normalized.pattern;
             if (!pattern || existingPatterns.has(pattern)) {
                 skipped++;
@@ -342,13 +409,10 @@ export default class MessageToImagePlugin extends GatewayPlugin {
         }
 
         this.setConfig('stRules', existingRules);
-        this.logger.info(`ST 正则规则导入: ${imported} 条导入, ${skipped} 条跳过`);
+        this._log('info', `ST 正则规则导入完成`, { imported, skipped });
         return { imported, skipped };
     }
 
-    /**
-     * 规范化 ST 正则规则字段
-     */
     _normalizeSTRule(raw) {
         return {
             name: raw.script_name || raw.scriptName || raw.name || '未命名',
@@ -368,9 +432,11 @@ export default class MessageToImagePlugin extends GatewayPlugin {
         switch (sub) {
             case 'on':
                 this.setConfig('enabled', true);
+                this._log('info', '插件已通过命令启用');
                 return ctx.reply('✅ 消息转图片已开启');
             case 'off':
                 this.setConfig('enabled', false);
+                this._log('info', '插件已通过命令关闭');
                 return ctx.reply('❌ 消息转图片已关闭');
             case 'status':
                 return this._cmdStatus(ctx);
@@ -382,6 +448,19 @@ export default class MessageToImagePlugin extends GatewayPlugin {
             case 'import-st':
             case '导入':
                 return this._cmdImportST(ctx);
+            case 'log':
+            case '日志':
+                return this._cmdLog(ctx);
+            case 'export-log':
+            case '导出日志':
+                return this._cmdExportLog(ctx);
+            case 'clear-log':
+            case '清空日志':
+                if (this._pluginLogger) {
+                    this._pluginLogger.clear();
+                    return ctx.reply('✅ 日志已清空');
+                }
+                return ctx.reply('日志记录器未初始化');
             case 'help':
             case '帮助':
             default:
@@ -393,7 +472,10 @@ export default class MessageToImagePlugin extends GatewayPlugin {
         const rendererReady = this._renderer?.ready || false;
         const cacheSize = this._renderer ? await this._renderer.getCacheSize() : 0;
         const cacheMB = (cacheSize / 1024 / 1024).toFixed(2);
+        const cacheCount = this._renderer ? await this._renderer.getCacheFileCount() : 0;
         const platforms = this.getConfig('applyToPlatforms') || [];
+        const stats = this._renderer?.getStats() || {};
+        const logCount = this._pluginLogger?.entries.length || 0;
 
         return ctx.reply([
             '🖼️ 消息转图片 - 状态',
@@ -406,8 +488,16 @@ export default class MessageToImagePlugin extends GatewayPlugin {
             `  最大宽度: ${this.getConfig('maxWidth') ?? 800}px`,
             `  模板预设: ${this.getConfig('templatePreset') || 'novel-card'}`,
             `  ST 规则: ${this.getConfig('stRules')?.length || 0} 条`,
-            `  缓存大小: ${cacheMB} MB`,
+            `  缓存: ${cacheCount} 个文件, ${cacheMB} MB`,
             `  生效平台: ${platforms.length ? platforms.join(', ') : '全部'}`,
+            '',
+            '📊 统计:',
+            `  总渲染次数: ${stats.totalRenders || 0}`,
+            `  缓存命中: ${stats.cacheHits || 0}, 未命中: ${stats.cacheMisses || 0}`,
+            `  失败次数: ${stats.failures || 0}`,
+            `  平均耗时: ${stats.avgRenderTime || 0}ms`,
+            `  队列长度: ${stats.queueLength || 0}`,
+            `  日志条数: ${logCount}`,
         ].join('\n'));
     }
 
@@ -426,6 +516,7 @@ export default class MessageToImagePlugin extends GatewayPlugin {
             const css = this.getConfig('baseCss') || '';
             const stRules = this.getConfig('stRules') || [];
 
+            this._log('info', '执行渲染测试命令');
             const imageUrl = await this._renderer.render(
                 this._escapeHtml(sampleText),
                 css,
@@ -434,9 +525,10 @@ export default class MessageToImagePlugin extends GatewayPlugin {
                 { roleName: '师尊', time: new Date().toLocaleString('zh-CN', { hour12: false }), messageId: 'test' }
             );
 
-            // 发送测试图片
+            this._log('info', '测试渲染成功', { imageUrl });
             await ctx.reply('🧪 渲染测试结果：', { mediaUrls: [imageUrl] });
         } catch (err) {
+            this._log('error', `测试渲染失败: ${err.message}`);
             return ctx.reply(`❌ 渲染失败: ${err.message}`);
         }
     }
@@ -446,11 +538,11 @@ export default class MessageToImagePlugin extends GatewayPlugin {
 
         const cacheDir = this._renderer.cacheDir;
         try {
-            const fs = await import('fs/promises');
             const files = await fs.readdir(cacheDir);
             for (const file of files) {
                 await fs.unlink(path.join(cacheDir, file));
             }
+            this._log('info', `缓存已清理`, { files: files.length });
             return ctx.reply(`✅ 已清理 ${files.length} 个缓存文件`);
         } catch (err) {
             return ctx.reply(`清理失败: ${err.message}`);
@@ -477,20 +569,78 @@ export default class MessageToImagePlugin extends GatewayPlugin {
         return ctx.reply(`✅ 导入完成: ${result.imported} 条导入, ${result.skipped} 条跳过`);
     }
 
+    async _cmdLog(ctx) {
+        if (!this._pluginLogger) {
+            return ctx.reply('日志记录器未初始化');
+        }
+
+        const count = parseInt(ctx.args[1]) || 20;
+        const level = ctx.args[2]?.toUpperCase();
+        const validLevels = ['INFO', 'WARN', 'ERROR', 'DEBUG'];
+        const filterLevel = validLevels.includes(level) ? level : null;
+
+        const logs = this._pluginLogger.recent(count, filterLevel);
+        if (logs.length === 0) {
+            return ctx.reply('暂无日志记录');
+        }
+
+        const text = logs.map(e => {
+            const ctx_str = e.context ? ` | ${e.context}` : '';
+            return `[${e.timestamp}] [${e.level}] ${e.message}${ctx_str}`;
+        }).join('\n');
+
+        // 截断超长文本
+        const truncated = text.length > 3500
+            ? text.slice(0, 3500) + `\n... (已截断，共 ${logs.length} 条)`
+            : text;
+
+        return ctx.reply(`📜 最近 ${logs.length} 条日志${filterLevel ? ` (${filterLevel})` : ''}:\n\n${truncated}`);
+    }
+
+    async _cmdExportLog(ctx) {
+        if (!this._pluginLogger) {
+            return ctx.reply('日志记录器未初始化');
+        }
+
+        const text = this._pluginLogger.exportText();
+        if (!text) {
+            return ctx.reply('暂无日志记录');
+        }
+
+        // 写入文件
+        const exportPath = path.join(__dirname, `log-export-${Date.now()}.txt`);
+        try {
+            await fs.writeFile(exportPath, text, 'utf-8');
+            this._log('info', '日志已导出', { path: exportPath });
+            return ctx.reply([
+                `✅ 日志已导出到: ${exportPath}`,
+                `   共 ${this._pluginLogger.entries.length} 条记录`,
+            ].join('\n'));
+        } catch (err) {
+            return ctx.reply(`导出失败: ${err.message}`);
+        }
+    }
+
     async _cmdHelp(ctx) {
         return ctx.reply([
-            '🖼️ 消息转图片插件 v1.0',
+            '🖼️ 消息转图片插件 v1.1',
             '',
             '命令:',
             '  /msg2img on - 开启',
             '  /msg2img off - 关闭',
-            '  /msg2img status - 查看状态',
+            '  /msg2img status - 查看状态和统计',
             '  /msg2img test - 渲染测试',
             '  /msg2img clear-cache - 清理缓存',
+            '  /msg2img log [数量] [级别] - 查看日志',
+            '  /msg2img export-log - 导出日志到文件',
+            '  /msg2img clear-log - 清空日志',
             '  /msg2img import-st <JSON> - 导入 ST 正则规则',
+            '  /msg2img help - 显示此帮助',
+            '',
+            '日志级别: INFO / WARN / ERROR / DEBUG',
+            '示例: /msg2img log 50 ERROR',
             '',
             '配置可通过面板「插件管理」中的配置按钮修改',
-            '支持自定义模板、CSS、ST 正则规则导入',
             '渲染模式: auto(长度阈值) / always(全部) / tagged(标签内)',
         ].join('\n'));
     }
