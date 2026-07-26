@@ -17,6 +17,32 @@ import path from 'path';
 import fs from 'fs/promises';
 import { fileURLToPath } from 'url';
 
+/**
+ * 把 renderer.js 产出的 file:// URI 转成对应平台适配器能正确消费的媒体引用。
+ *
+ * - QQ(OneBot)：CQ 图片段的 file 字段官方支持 file:// URI（要求 NapCat 与网关
+ *   同机/同文件系统可见），保留原样。
+ * - 其它平台（Telegram/Discord 等）：其底层库（node-telegram-bot-api /
+ *   discord.js）不识别 file:// scheme——要么会尝试把整个字符串（含协议头）当
+ *   本地路径读盘从而 ENOENT，要么当成远程 URL 交给平台服务端抓取，而平台服务端
+ *   根本连不到网关本机/内网地址。两种情况都会在 adapter.send() 内部抛出异常，
+ *   于是每次都命中下面 catch 分支的"渲染失败回退原文"，图片永远发不出去。
+ *   这里转换为裸本地文件路径，触发这些库"读取本地文件直接上传"的分支，
+ *   不依赖网关是否有公网可达地址。
+ *
+ * @param {string} fileUrl - render() 返回的 file:// URI
+ * @param {string} platform - 目标平台
+ * @returns {string}
+ */
+function toMediaRef(fileUrl, platform) {
+    if (platform === 'qq') return fileUrl;
+    try {
+        return fileURLToPath(fileUrl);
+    } catch (_) {
+        return fileUrl; // 解析失败则原样返回，不影响原有行为
+    }
+}
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
@@ -187,6 +213,25 @@ export default class MessageToImagePlugin extends GatewayPlugin {
         // 递归守卫
         if (message.metadata?._msg2imgProcessed) return message;
 
+        // ⭐ 关键修复：消息队列重试去重守卫。
+        //
+        // 本方法返回 null 会让 dispatchOutbound() 整体返回 false——但网关的消息队列
+        // 把"过滤器丢弃了消息"和"发送失败"视为同一种情况，会按 messageQueue.maxRetries
+        // （默认 3 次）对同一条原始消息对象重新调用一遍完整的出站处理流程,包括本过滤器。
+        // 如果不加守卫，每次重试都会重新触发一次 _renderAndReplace()——也就是重新渲染
+        // 一次、重新补发一次消息，导致同一条 AI 回复被渲染/补发最多 3 次。
+        // 表现为：用户先等一会儿（等第一次渲染+发送尝试完成/失败），然后看到同样的内容
+        // 被发送了 2~3 次（如果渲染或图片投递失败，补发的是原始文本，看起来就是
+        // "延迟后重复转发了几遍一样的正文"）。
+        //
+        // 消息队列在重试时复用同一个 message 对象引用（不会重新创建），所以可以用
+        // metadata 打标记：第一次命中渲染条件时打标记并真正触发异步渲染；
+        // 之后（无论是队列重试还是任何其它原因）再次经过这里，只丢弃、不再重复触发。
+        if (message.metadata?._msg2imgTriggered) {
+            this._log('debug', '消息已触发过渲染（消息队列重试同一条消息），跳过重复渲染');
+            return null;
+        }
+
         // 判断是否需要渲染
         const renderMode = this.getConfig('renderMode') || 'auto';
         const { shouldRender, renderContent, isExcerpt } = this._extractRenderContent(message.content, renderMode);
@@ -206,6 +251,11 @@ export default class MessageToImagePlugin extends GatewayPlugin {
             renderContentLength: renderContent.length,
             isExcerpt,
         });
+
+        // 打标记必须在触发异步渲染之前、同步完成，才能保证消息队列的重试
+        // （哪怕紧跟着立刻发生）也能看到标记。
+        message.metadata = message.metadata || {};
+        message.metadata._msg2imgTriggered = true;
 
         // 异步渲染（不阻塞过滤器链）
         this._renderAndReplace(message, renderContent, isExcerpt);
@@ -289,13 +339,18 @@ export default class MessageToImagePlugin extends GatewayPlugin {
 
             this._log('info', `渲染成功 (${Date.now() - startTime}ms)`, { imageUrl });
 
+            // 按目标平台转换媒体引用：QQ 保留 file:// URI，其它平台转为裸本地路径
+            // （见文件顶部 toMediaRef 说明——这是"图片一直发不出去、只能收到回退文本"
+            // 的另一个根因：Telegram/Discord 等适配器不认识 file:// scheme）。
+            const mediaRef = toMediaRef(imageUrl, originalMessage.platform);
+
             // 构造图片消息
             const imgMsg = new OutboundMessage({
                 platform: originalMessage.platform,
                 chatId: originalMessage.chatId,
                 chatType: originalMessage.chatType,
                 content: '',
-                mediaUrls: [imageUrl],
+                mediaUrls: [mediaRef],
                 replyToId: originalMessage.replyToId || '',
             });
             imgMsg.metadata = { ...originalMessage.metadata, _msg2imgProcessed: true };
@@ -310,13 +365,16 @@ export default class MessageToImagePlugin extends GatewayPlugin {
                     this._log('info', 'tagged 模式：先发送剩余文本', { remainingLength: remainingText.length });
                     originalMessage.content = remainingText;
                     originalMessage.metadata._msg2imgProcessed = true;
-                    gateway.sendDirect(originalMessage, { bypassFilters: true, skipDedup: true });
+                    // 不再 skipDedup：既然重试风暴已用 _msg2imgTriggered 守卫从根上堵住，
+                    // 无需再靠豁免去重来"兜底放行"——保留网关的 15 秒内容去重作为
+                    // 最后一道安全网，避免任何遗漏路径导致的重复发送逃过去重。
+                    gateway.sendDirect(originalMessage, { bypassFilters: true });
                 }
             }
 
             // 发送图片
-            this._log('info', '发送图片消息', { platform: imgMsg.platform, chatId: imgMsg.chatId });
-            await gateway.sendDirect(imgMsg, { bypassFilters: true, skipDedup: true });
+            this._log('info', '发送图片消息', { platform: imgMsg.platform, chatId: imgMsg.chatId, mediaRef });
+            await gateway.sendDirect(imgMsg, { bypassFilters: true });
             this._log('info', '图片消息已发送');
         } catch (err) {
             this._log('error', `渲染失败，回退为原文本: ${err.message}`, {
@@ -332,7 +390,7 @@ export default class MessageToImagePlugin extends GatewayPlugin {
             });
             fallbackMsg.metadata = { ...originalMessage.metadata, _msg2imgProcessed: true };
             try {
-                await gateway.sendDirect(fallbackMsg, { bypassFilters: true, skipDedup: true });
+                await gateway.sendDirect(fallbackMsg, { bypassFilters: true });
                 this._log('info', '原文本已补发');
             } catch (sendErr) {
                 this._log('error', `补发原文本也失败: ${sendErr.message}`);
@@ -526,7 +584,8 @@ export default class MessageToImagePlugin extends GatewayPlugin {
             );
 
             this._log('info', '测试渲染成功', { imageUrl });
-            await ctx.reply('🧪 渲染测试结果：', { mediaUrls: [imageUrl] });
+            const mediaRef = toMediaRef(imageUrl, ctx.platform);
+            await ctx.reply('🧪 渲染测试结果：', { mediaUrls: [mediaRef] });
         } catch (err) {
             this._log('error', `测试渲染失败: ${err.message}`);
             return ctx.reply(`❌ 渲染失败: ${err.message}`);

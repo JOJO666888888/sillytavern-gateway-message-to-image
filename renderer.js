@@ -467,7 +467,12 @@ ${html}
                 throw new Error(`截图后文件不存在: ${filePath}`);
             }
 
-            const fileUrl = `file:///${filePath.replace(/\\/g, '/')}`;
+            // 修复：filePath 在 Linux/macOS 上已是绝对路径（以 / 开头），
+            // 若再拼接字面量 'file:///' 会产生 4 个斜杠(file:////...)的畸形 URI，
+            // 部分下游库（Node URL 解析、discord.js 附件解析等）会解析异常甚至找不到文件。
+            // 仅在路径本身不以 / 开头时（如 Windows 的 C:/...）补一个 /，确保恒定 3 斜杠。
+            const normalizedPath = filePath.replace(/\\/g, '/');
+            const fileUrl = `file://${normalizedPath.startsWith('/') ? '' : '/'}${normalizedPath}`;
             this.logger.debug(`[${renderId}] 步骤7 完成: 返回 file URL`, { url: fileUrl });
             return fileUrl;
         } catch (err) {

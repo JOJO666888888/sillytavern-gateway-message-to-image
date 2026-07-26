@@ -1,7 +1,7 @@
 {
     "name": "message-to-image",
     "displayName": "消息转图片",
-    "version": "1.1.0",
+    "version": "1.1.1",
     "author": "gateway-plugin",
     "description": "将AI回复内容渲染为精美图片发送。支持ST正则美化规则导入、自定义HTML模板和CSS、内置4套预设模板。基于puppeteer-core渲染引擎，带缓存、并发控制和分级日志。需系统已安装Chrome/Chromium。",
     "main": "index.js",
