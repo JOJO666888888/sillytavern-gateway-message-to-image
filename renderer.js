@@ -9,6 +9,19 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 /**
+ * 把本地绝对路径转成规范的 file:// URI。
+ *
+ * 必须走这一个函数，不要在调用点手拼。之前 render() 和 _getCachedImage()
+ * 各拼一次 `file:///${path}`，Linux/macOS 上 path 本就以 / 开头，拼出来是
+ * 4 个斜杠的畸形 URI（file:////home/...）。修的时候只改了 render() 那处，
+ * 缓存命中那处漏了——症状变成"第一次渲染能发出去，同样内容再发一次就失败"。
+ */
+function toFileUrl(filePath) {
+    const normalized = filePath.replace(/\\/g, '/');
+    return `file://${normalized.startsWith('/') ? '' : '/'}${normalized}`;
+}
+
+/**
  * 系统已安装的 Chrome/Chromium 可能路径（按优先级排序）
  * 覆盖 Linux 桌面、macOS、Windows、Termux(Android) 等环境
  */
@@ -143,9 +156,21 @@ export class ImageRenderer {
             ],
         };
 
+        // 查找顺序：插件配置 > 环境变量 > 常见安装路径。
+        // 环境变量这一层是为容器准备的：镜像里的 Chromium 装在哪由构建方决定，
+        // 不该逼用户去改插件配置——设个 PUPPETEER_EXECUTABLE_PATH 就能跑。
+        // 这两个名字是 puppeteer 生态的既有约定，用户大概率已经会设。
+        const envPath = process.env.PUPPETEER_EXECUTABLE_PATH || process.env.CHROME_PATH;
+
         if (this.options.executablePath) {
             launchOptions.executablePath = this.options.executablePath;
             this.logger.info('使用配置指定的 Chrome 路径', { path: this.options.executablePath });
+        } else if (envPath) {
+            launchOptions.executablePath = envPath;
+            this.logger.info('使用环境变量指定的 Chrome 路径', { path: envPath });
+            if (!existsSync(envPath)) {
+                this.logger.warn('环境变量指向的 Chrome 不存在，启动大概率会失败', { path: envPath });
+            }
         } else {
             // 自动检测系统已安装的 Chrome/Chromium
             let detected = null;
@@ -159,7 +184,8 @@ export class ImageRenderer {
                 launchOptions.executablePath = detected;
                 this.logger.info('自动检测到系统 Chrome', { path: detected });
             } else {
-                this.logger.warn('未找到系统 Chrome，puppeteer-core 需要外部浏览器。请在配置中设置 executablePath');
+                this.logger.warn('未找到系统 Chrome，puppeteer-core 需要外部浏览器。' +
+                    '请设置插件配置 executablePath，或环境变量 PUPPETEER_EXECUTABLE_PATH');
             }
         }
 
@@ -467,12 +493,7 @@ ${html}
                 throw new Error(`截图后文件不存在: ${filePath}`);
             }
 
-            // 修复：filePath 在 Linux/macOS 上已是绝对路径（以 / 开头），
-            // 若再拼接字面量 'file:///' 会产生 4 个斜杠(file:////...)的畸形 URI，
-            // 部分下游库（Node URL 解析、discord.js 附件解析等）会解析异常甚至找不到文件。
-            // 仅在路径本身不以 / 开头时（如 Windows 的 C:/...）补一个 /，确保恒定 3 斜杠。
-            const normalizedPath = filePath.replace(/\\/g, '/');
-            const fileUrl = `file://${normalizedPath.startsWith('/') ? '' : '/'}${normalizedPath}`;
+            const fileUrl = toFileUrl(filePath);
             this.logger.debug(`[${renderId}] 步骤7 完成: 返回 file URL`, { url: fileUrl });
             return fileUrl;
         } catch (err) {
@@ -510,7 +531,7 @@ ${html}
         const filePath = path.join(this.cacheDir, fileName);
         try {
             await fs.access(filePath);
-            return `file:///${filePath.replace(/\\/g, '/')}`;
+            return toFileUrl(filePath);
         } catch {
             return null;
         }
